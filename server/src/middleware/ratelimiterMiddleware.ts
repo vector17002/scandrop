@@ -1,5 +1,8 @@
 import type {Request, Response, NextFunction } from "express";
 import RateLimiter from "../models/ratelimiter.js";
+import Logger from "../models/logger.js";
+
+const logger = Logger.getInstance("Rate Limiter Middleware Initialized", "INFO", new Date());
 
 const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) => {
 
@@ -9,12 +12,14 @@ const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) 
     const ip = req.ip;
 
     if(!ip){
+        logger.log('IP address not found.', 'ERROR', new Date());
         return res.status(400).send('IP address not found.');
     }
 
-    console.log(`IP: ${ip}, Requests: ${rateLimiter.requests.get(ip)?.count || 0} with last timestamp: ${rateLimiter.requests.get(ip)?.timestamp || 0}`);
+    logger.log(`IP: ${ip}, Requests: ${rateLimiter.requests.get(ip)?.count || 0} with last timestamp: ${rateLimiter.requests.get(ip)?.timestamp || 0}`, "INFO", new Date());
     
     if (!rateLimiter.isAllowed(ip)) {
+        logger.log(`IP: ${ip} has exceeded the rate limit.`, "ERROR", new Date());
         return res.status(429).send('Too many requests. Please try again later.');
     }
 

@@ -1,11 +1,9 @@
 type LoggerType = "ERROR" | "INFO" | "DEBUG";
 
 class Logger {
-  public static instance : Logger | null;
+  private static instance : Logger | null;
 
-  private constructor() {
-
-  }
+  private constructor() {}
 
   public static getInstance(msg: string , type : LoggerType, timestamp: Date): Logger {
     if (!Logger.instance) {
@@ -25,3 +23,5 @@ class Logger {
   }
 
 }
+
+export default Logger;

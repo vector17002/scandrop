@@ -1,6 +1,6 @@
 //singleton class for rate limiter
 class RateLimiter {
-   public static instance: RateLimiter | null = null;
+   private static instance: RateLimiter | null = null;
    public requests: Map<string | import("express").Request["ip"], { count: number; timestamp: number }> = new Map();
    private constructor(private limit: number, private interval: number) {}
 
