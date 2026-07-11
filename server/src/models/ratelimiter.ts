@@ -2,6 +2,7 @@
 class RateLimiter {
    private static instance: RateLimiter | null = null;
    public requests: Map<string | import("express").Request["ip"], { count: number; timestamp: number }> = new Map();
+   private lastSweepTime: number = 0;
    private constructor(private limit: number, private interval: number) {}
 
    public static getInstance(limit: number, interval: number): RateLimiter {
@@ -19,7 +20,8 @@ class RateLimiter {
        const currentTime = Date.now();
        const requestInfo = this.requests.get(ip);
 
-       if(this.requests.size > 1000){
+       if(this.requests.size > 1000 && currentTime - this.lastSweepTime > 10*1000) {
+        this.lastSweepTime = currentTime;
           for (const [key, value] of this.requests) {
               if (currentTime - value.timestamp > this.interval) {
                   this.requests.delete(key);
