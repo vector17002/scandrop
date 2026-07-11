@@ -2,10 +2,7 @@
 class RateLimiter {
    public static instance: RateLimiter | null = null;
    public requests: Map<string | import("express").Request["ip"], { count: number; timestamp: number }> = new Map();
-   private constructor(private limit: number, private interval: number) {
-      this.limit = limit
-      this.interval = interval
-   }
+   private constructor(private limit: number, private interval: number) {}
 
    public static getInstance(limit: number, interval: number): RateLimiter {
        if (!RateLimiter.instance) {
@@ -21,6 +18,14 @@ class RateLimiter {
    public isAllowed(ip: string | import("express").Request["ip"]): boolean {
        const currentTime = Date.now();
        const requestInfo = this.requests.get(ip);
+
+       if(this.requests.size > 1000){
+          for (const [key, value] of this.requests) {
+              if (currentTime - value.timestamp > this.interval) {
+                  this.requests.delete(key);
+              }
+          }
+       }
 
        if (!requestInfo) {
            this.requests.set(ip, { count: 1, timestamp: currentTime });

@@ -1,7 +1,7 @@
-import Router from 'express'
+import express from 'express'
 import rateLimiterMiddleware from '../middleware/ratelimiterMiddleware.js';
 
-const router = Router();
+const router = express.Router();
 
 router.get('/', rateLimiterMiddleware, (req, res) => {
     res.send('Upload route is working!');

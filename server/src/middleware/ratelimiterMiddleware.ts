@@ -8,6 +8,10 @@ const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) 
 
     const ip = req.ip;
 
+    if(!ip){
+        return res.status(400).send('IP address not found.');
+    }
+
     console.log(`IP: ${ip}, Requests: ${rateLimiter.requests.get(ip)?.count || 0} with last timestamp: ${rateLimiter.requests.get(ip)?.timestamp || 0}`);
     
     if (!rateLimiter.isAllowed(ip)) {
