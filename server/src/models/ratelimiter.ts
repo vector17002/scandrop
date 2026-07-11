@@ -1,0 +1,51 @@
+//singleton class for rate limiter
+class RateLimiter {
+   private static instance: RateLimiter | null = null;
+   public requests: Map<string | import("express").Request["ip"], { count: number; timestamp: number }> = new Map();
+   private lastSweepTime: number = 0;
+   private constructor(private limit: number, private interval: number) {}
+
+   public static getInstance(limit: number, interval: number): RateLimiter {
+       if (!RateLimiter.instance) {
+           RateLimiter.instance = new RateLimiter(limit, interval);
+       }
+       return RateLimiter.instance;
+   }
+
+   public static resetInstance(): void {
+       RateLimiter.instance = null;
+   }
+
+   public isAllowed(ip: string | import("express").Request["ip"]): boolean {
+       const currentTime = Date.now();
+       const requestInfo = this.requests.get(ip);
+
+       if(this.requests.size > 1000 && currentTime - this.lastSweepTime > 10*1000) {
+        this.lastSweepTime = currentTime;
+          for (const [key, value] of this.requests) {
+              if (currentTime - value.timestamp > this.interval) {
+                  this.requests.delete(key);
+              }
+          }
+       }
+
+       if (!requestInfo) {
+           this.requests.set(ip, { count: 1, timestamp: currentTime });
+           return true;
+       }
+
+       if (currentTime - requestInfo.timestamp > this.interval) {
+           this.requests.set(ip, { count: 1, timestamp: currentTime });
+           return true;
+       }
+
+       if (requestInfo.count < this.limit) {
+           this.requests.set(ip, { count: requestInfo.count + 1, timestamp: requestInfo.timestamp });
+           return true;
+       }
+
+       return false;
+   }
+}
+
+export default RateLimiter;
