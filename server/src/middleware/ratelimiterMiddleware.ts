@@ -1,8 +1,6 @@
 import type {Request, Response, NextFunction } from "express";
 import RateLimiter from "../models/ratelimiter.js";
-import Logger from "../models/logger.js";
-
-const logger = Logger.getInstance("Rate Limiter Middleware Initialized", "INFO", new Date());
+import logger from "../utils/logger.js";
 
 const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) => {
 

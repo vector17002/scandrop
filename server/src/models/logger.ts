@@ -1,3 +1,6 @@
+import { updateLogsFile } from "../services/s3.service.js";
+import { updateLocalFileLogs } from "../utils/localFileLogsUpdate.js";
+
 type LoggerType = "ERROR" | "INFO" | "DEBUG";
 
 class Logger {
@@ -16,12 +19,18 @@ class Logger {
     Logger.instance = null;
   }
 
-  public log(msg: string, type: LoggerType, timestamp: Date): void {
-    console.log(`[${timestamp.toISOString()}] : [${type}] : ${msg}`);
+  public async log(msg: string, type: LoggerType, timestamp: Date): Promise<void> {
 
-    // ANSH - IMPLEMENT FUNCTIONALITY TO LOG THE LOGS IN S3.
+    const logMessage = `[${timestamp.toISOString()}] : [${type}] : ${msg}`;
+    console.log(logMessage);
+    
+    try{
+    updateLocalFileLogs(logMessage);
+    updateLogsFile("logs/logs.txt", "data/logs.txt");
+  }catch(err){
+    console.error("Error while logging to S3: ", err);
   }
+  }}
 
-}
 
 export default Logger;
