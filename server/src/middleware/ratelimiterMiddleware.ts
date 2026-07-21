@@ -5,7 +5,7 @@ import logger from "../utils/logger.js";
 const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) => {
 
     // Allowing 5 requests per minute per IP address
-    const rateLimiter = RateLimiter.getInstance(5, 60 * 1000); 
+    const rateLimiter = RateLimiter.getInstance(50, 60 * 1000); 
 
     const ip = req.ip;
 

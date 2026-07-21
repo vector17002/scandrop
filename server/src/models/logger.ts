@@ -21,7 +21,7 @@ class Logger {
 
   public async log(msg: string, type: LoggerType): Promise<void> {
     const timestamp = new Date()
-    const logMessage = `[${timestamp.toDateString()}] : [${type}] : ${msg}`;
+    const logMessage = `[${timestamp.toISOString()}] : [${type}] : ${msg}`;
     console.log(logMessage);
     
     try{
