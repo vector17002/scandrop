@@ -8,7 +8,7 @@ class Logger {
 
   private constructor() {}
 
-  public static getInstance(msg: string , type : LoggerType, timestamp: Date): Logger {
+  public static getInstance(msg: string , type : LoggerType): Logger {
     if (!Logger.instance) {
       Logger.instance = new Logger();
     }
@@ -19,9 +19,9 @@ class Logger {
     Logger.instance = null;
   }
 
-  public async log(msg: string, type: LoggerType, timestamp: Date): Promise<void> {
-
-    const logMessage = `[${timestamp.toISOString()}] : [${type}] : ${msg}`;
+  public async log(msg: string, type: LoggerType): Promise<void> {
+    const timestamp = new Date()
+    const logMessage = `[${timestamp.toDateString()}] : [${type}] : ${msg}`;
     console.log(logMessage);
     
     try{

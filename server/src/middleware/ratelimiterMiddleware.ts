@@ -10,14 +10,14 @@ const rateLimiterMiddleware = (req: Request, res: Response, next: NextFunction) 
     const ip = req.ip;
 
     if(!ip){
-        logger.log('IP address not found.', 'ERROR', new Date());
+        logger.log('IP address not found.', 'ERROR');
         return res.status(400).send('IP address not found.');
     }
 
-    logger.log(`IP: ${ip}, Requests: ${rateLimiter.requests.get(ip)?.count || 0} with last timestamp: ${rateLimiter.requests.get(ip)?.timestamp || 0}`, "INFO", new Date());
+    logger.log(`IP: ${ip}, Requests: ${rateLimiter.requests.get(ip)?.count || 0} with last timestamp: ${rateLimiter.requests.get(ip)?.timestamp || 0}`, "INFO");
     
     if (!rateLimiter.isAllowed(ip)) {
-        logger.log(`IP: ${ip} has exceeded the rate limit.`, "ERROR", new Date());
+        logger.log(`IP: ${ip} has exceeded the rate limit.`, "ERROR");
         return res.status(429).send('Too many requests. Please try again later.');
     }
 

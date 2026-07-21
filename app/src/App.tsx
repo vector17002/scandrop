@@ -62,12 +62,12 @@ export default function App() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0]
     if (selectedFile) {
-      startSimulatedUpload(selectedFile)
+      startUpload(selectedFile)
     }
   }
 
-  // Simulate Large File Upload (Direct-to-S3 Multipart Upload)
-  const startSimulatedUpload = (file: File) => {
+  // Upload file via backend API → presigned URL → direct S3 upload
+  const startUpload = async (file: File) => {
     const sizeStr = formatBytes(file.size)
     setUpload({
       file,
@@ -81,46 +81,102 @@ export default function App() {
       qrCodeUrl: '',
     })
 
-    let currentProgress = 0
-    const uploadSpeedMB = Math.floor(Math.random() * 35) + 25 
-    
-    const interval = setInterval(() => {
-      currentProgress += Math.floor(Math.random() * 8) + 4
-      if (currentProgress >= 100) {
-        currentProgress = 100
-        clearInterval(interval)
-        
-        const transferId = Math.random().toString(36).substring(2, 8)
-        const mockLink = `${window.location.origin}/download/${transferId}`
-        
-        // Generate QR Code. Light mode uses white bg, Dark mode uses deep black bg
-        const qrColor = 'ea580c' // Orange
-        const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
-        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(mockLink)}&color=${qrColor}&bgcolor=${qrBg}`
+    try {
+      // Step 1: Request a presigned upload URL from the backend
+      const response = await fetch('/api/v1/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contentType: file.type || 'application/octet-stream',
+          fileName: file.name,
+          fileSize: file.size,
+        }),
+      })
 
-        setUpload(prev => ({
-          ...prev,
-          progress: 100,
-          speed: '0 MB/s',
-          timeRemaining: '0s',
-          status: 'completed',
-          shareLink: mockLink,
-          qrCodeUrl: qrUrl,
-        }))
-        triggerNotification('File uploaded directly to temporary S3 pool!')
-      } else {
-        const remainingBytes = file.size * (1 - currentProgress / 100)
-        const speedBytes = uploadSpeedMB * 1024 * 1024
-        const secondsRemaining = Math.max(1, Math.round(remainingBytes / speedBytes))
-        
-        setUpload(prev => ({
-          ...prev,
-          progress: currentProgress,
-          speed: `${uploadSpeedMB} MB/s`,
-          timeRemaining: `${secondsRemaining}s`,
-        }))
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}))
+        throw new Error(errBody.error || `Server responded with ${response.status}`)
       }
-    }, 200)
+
+      const data = await response.json()
+      const { url, fileID } = data
+
+      if (!url) {
+        throw new Error('No presigned URL received from server')
+      }
+
+      // Step 2: Upload file directly to S3 using the presigned URL
+      await uploadFileToS3(file, url, fileID)
+    } catch (err) {
+      console.error('Upload failed:', err)
+      setUpload(prev => ({
+        ...prev,
+        status: 'failed',
+        speed: '0 MB/s',
+        timeRemaining: '—',
+      }))
+      triggerNotification(
+        `Upload failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+      )
+    }
+  }
+
+  // Direct-to-S3 upload with real progress tracking via XMLHttpRequest
+  const uploadFileToS3 = (file: File, presignedUrl: string, fileID: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      const startTime = Date.now()
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const progress = Math.round((e.loaded / e.total) * 100)
+          const elapsedSec = (Date.now() - startTime) / 1000
+          const speedBps = elapsedSec > 0 ? e.loaded / elapsedSec : 0
+          const speedMB = (speedBps / (1024 * 1024)).toFixed(1)
+          const remaining = e.total - e.loaded
+          const secondsLeft = speedBps > 0 ? Math.max(1, Math.round(remaining / speedBps)) : 0
+
+          setUpload(prev => ({
+            ...prev,
+            progress,
+            speed: `${speedMB} MB/s`,
+            timeRemaining: `${secondsLeft}s`,
+          }))
+        }
+      })
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const transferId = fileID || Math.random().toString(36).substring(2, 8)
+          const shareLink = `${window.location.origin}/download/${transferId}`
+
+          const qrColor = 'ea580c' // Orange
+          const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
+          const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(shareLink)}&color=${qrColor}&bgcolor=${qrBg}`
+
+          setUpload(prev => ({
+            ...prev,
+            progress: 100,
+            speed: '0 MB/s',
+            timeRemaining: '0s',
+            status: 'completed',
+            shareLink,
+            qrCodeUrl: qrUrl,
+          }))
+          triggerNotification('File uploaded directly to S3!')
+          resolve()
+        } else {
+          reject(new Error(`S3 upload failed with status ${xhr.status}`))
+        }
+      })
+
+      xhr.addEventListener('error', () => reject(new Error('Network error during S3 upload')))
+      xhr.addEventListener('abort', () => reject(new Error('Upload was aborted')))
+
+      xhr.open('PUT', presignedUrl)
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+      xhr.send(file)
+    })
   }
 
   // Reset upload states
@@ -439,6 +495,40 @@ export default function App() {
                         Upload Another File
                       </button>
                     </div>
+                  </div>
+                )}
+
+                {upload.status === 'failed' && (
+                  <div className="flex flex-col items-center justify-center min-h-[300px] animate-fade-in text-center">
+                    <div className={`w-14 h-14 rounded-full flex items-center justify-center mb-4 ${
+                      isLight ? 'bg-red-500/10 border border-red-500/20 text-red-600' : 'bg-red-500/10 border border-red-500/20 text-red-400'
+                    }`}>
+                      <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </div>
+
+                    <h3 className={`text-lg font-bold mb-1 ${isLight ? 'text-slate-900' : 'text-white'}`}>Upload Failed</h3>
+                    <p className={`text-xs mb-6 max-w-[280px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                      Something went wrong while uploading <span className="font-mono font-semibold">{upload.fileName}</span>. Please check your connection and try again.
+                    </p>
+
+                    <button
+                      onClick={() => {
+                        handleReset()
+                        fileInputRef.current?.click()
+                      }}
+                      className="w-full py-3 rounded-xl text-xs font-bold text-white transition-all shadow-md bg-orange-600 hover:bg-orange-500 shadow-orange-500/10"
+                    >
+                      Try Again
+                    </button>
+
+                    <button 
+                      onClick={handleReset}
+                      className="text-xs font-bold text-slate-500 hover:text-slate-400 transition-colors pt-4 block mx-auto"
+                    >
+                      Cancel
+                    </button>
                   </div>
                 )}
               </div>
