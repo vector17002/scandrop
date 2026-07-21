@@ -1,18 +1,22 @@
 
 import fs from "fs"
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { CreateMultipartUploadCommand, DeleteObjectCommand, GetObjectCommand, PutObjectCommand, UploadPartCommand } from "@aws-sdk/client-s3";
 import s3Client from "../config/s3.js";
 import logger from "../utils/logger.js";
 import { getPresignedUrl } from "../utils/getPresignedUrl.js";
+import { generateId } from "../utils/generateId.js";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
 
 const BUCKET = process.env.AWS_S3_BUCKET_NAME
+const ENVIRONMENT = process.env.NODE_ENV || "development"
 
 export const updateLogsFile = async (fileKey : string, localFilePath : string) => {
-      try{
+    try{
     // ANSH - IMPLEMENT FUNCTIONALITY TO LOG THE LOGS IN S3.
     const fileContents = fs.readFileSync(localFilePath, "utf-8");
 
-    //@ts-ignore
+    // @ts-ignore
     await s3Client.send(
       new PutObjectCommand({
         Bucket: BUCKET,
@@ -56,16 +60,51 @@ export const deleteLogsFile = async (fileKey : string) => {
   }
 }
 
-export const upload = async (contentType : string) =>  {
+export const uploadSingleFile = async (contentType : string) =>  {
   try{
-     const {url , fileID} = await getPresignedUrl(contentType);
+     const fileID = generateId()
+     const {url} = await getPresignedUrl(fileID, contentType);
 
      return {url , fileID}
   }catch(err){
-    logger.log(`Upload failed for fileId`, "ERROR")
+     logger.log(`Upload failed for contentType "${contentType}": ${err instanceof Error ? err.message : err}`, "ERROR")
   }
 }
 
-export const multiPartUpload = async () => {
-  
+export const multiPartUpload = async (contentType : string, partCount : number) => {
+   try{
+    const fileID = generateId(); 
+
+    //@ts-ignore
+    const multiPartUploadCommand = await s3Client.send(
+      new CreateMultipartUploadCommand({
+        Bucket: BUCKET,
+        Key: `${ENVIRONMENT}/${fileID}`,
+        ContentType: contentType
+      })
+    );
+
+    const urls = await Promise.all(
+      Array.from({length :  partCount}, async (_ , index) => {
+        const partNumber = index + 1
+        const individualPartCommand = new UploadPartCommand({
+          Bucket: BUCKET,
+          Key: `${ENVIRONMENT}/${fileID}`,
+          UploadId: multiPartUploadCommand.UploadId,
+          PartNumber: partNumber
+        })
+
+        return {
+          partNumber,
+          //@ts-ignore
+          url: await getSignedUrl(s3Client, individualPartCommand, { expiresIn: 60 * 60 })
+        }
+      } )
+    )
+
+    return { uploadId: multiPartUploadCommand.UploadId, key: `${ENVIRONMENT}/${fileID}`, urls }
+     
+   }catch(err){
+     logger.log(`Error executing multipart upload`, "ERROR")
+   }
 }
