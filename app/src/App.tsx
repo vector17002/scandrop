@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 
+const CHUNK_SIZE = 10 * 1024 * 1024 // 10MB per part — must match server
+const MAX_CONCURRENT_UPLOADS = 4
+
 interface UploadState {
   file: File | null
   fileName: string
@@ -10,6 +13,8 @@ interface UploadState {
   status: 'idle' | 'uploading' | 'completed' | 'failed'
   shareLink: string
   qrCodeUrl: string
+  uploadedParts: number
+  totalParts: number
 }
 
 export default function App() {
@@ -28,6 +33,8 @@ export default function App() {
     status: 'idle',
     shareLink: '',
     qrCodeUrl: '',
+    uploadedParts: 0,
+    totalParts: 0,
   })
 
   // Recipient Simulation State
@@ -62,12 +69,172 @@ export default function App() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0]
     if (selectedFile) {
-      startSimulatedUpload(selectedFile)
+      startUpload(selectedFile)
     }
   }
 
-  // Simulate Large File Upload (Direct-to-S3 Multipart Upload)
-  const startSimulatedUpload = (file: File) => {
+  // Upload a single chunk to S3 via presigned URL (for multipart uploads)
+  const uploadPart = (
+    chunk: Blob,
+    url: string,
+    partNumber: number,
+    onProgress: (partNumber: number, loaded: number) => void,
+  ): Promise<{ PartNumber: number; ETag: string }> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          onProgress(partNumber, e.loaded)
+        }
+      })
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader('ETag')
+          if (!etag) {
+            reject(new Error(`Part ${partNumber}: No ETag in response. Ensure S3 CORS exposes the ETag header.`))
+            return
+          }
+          resolve({ PartNumber: partNumber, ETag: etag })
+        } else {
+          reject(new Error(`Part ${partNumber} failed with status ${xhr.status}`))
+        }
+      })
+
+      xhr.addEventListener('error', () => reject(new Error(`Part ${partNumber}: network error`)))
+      xhr.addEventListener('abort', () => reject(new Error(`Part ${partNumber}: aborted`)))
+
+      xhr.open('PUT', url)
+      xhr.send(chunk)
+    })
+  }
+
+  // Orchestrate multipart upload: init → parallel chunk uploads → complete
+  const startMultipartUpload = async (file: File) => {
+    // Step 1: Initiate multipart upload via backend
+    const initResponse = await fetch('/api/v1/multipartupload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contentType: file.type || 'application/octet-stream',
+        fileName: file.name,
+        fileSize: file.size,
+      }),
+    })
+
+    if (!initResponse.ok) {
+      const errBody = await initResponse.json().catch(() => ({}))
+      throw new Error(errBody.error || `Server responded with ${initResponse.status}`)
+    }
+
+    const { uploadId, key, urls } = await initResponse.json()
+
+    if (!uploadId || !key || !urls?.length) {
+      throw new Error('Invalid multipart upload initiation response')
+    }
+
+    const totalParts = urls.length
+    setUpload(prev => ({ ...prev, totalParts }))
+
+    // Step 2: Upload all parts with concurrency control
+    const partProgress: number[] = new Array(totalParts).fill(0)
+    const startTime = Date.now()
+    const completedParts: { PartNumber: number; ETag: string }[] = []
+
+    const onPartProgress = (partNumber: number, loaded: number) => {
+      partProgress[partNumber - 1] = loaded
+      const totalLoaded = partProgress.reduce((a, b) => a + b, 0)
+      const progress = Math.min(99, Math.round((totalLoaded / file.size) * 100))
+      const elapsedSec = (Date.now() - startTime) / 1000
+      const speedBps = elapsedSec > 0 ? totalLoaded / elapsedSec : 0
+      const speedMB = (speedBps / (1024 * 1024)).toFixed(1)
+      const remaining = file.size - totalLoaded
+      const secondsLeft = speedBps > 0 ? Math.max(1, Math.round(remaining / speedBps)) : 0
+
+      setUpload(prev => ({
+        ...prev,
+        progress,
+        speed: `${speedMB} MB/s`,
+        timeRemaining: `${secondsLeft}s`,
+      }))
+    }
+
+    // Parallel uploads with concurrency limit
+    await new Promise<void>((resolve, reject) => {
+      let active = 0
+      let nextIndex = 0
+      let failed = false
+
+      const launchNext = () => {
+        if (failed) return
+
+        while (active < MAX_CONCURRENT_UPLOADS && nextIndex < totalParts) {
+          const partInfo = (urls as { partNumber: number; url: string }[])[nextIndex++]
+          const start = (partInfo.partNumber - 1) * CHUNK_SIZE
+          const end = Math.min(start + CHUNK_SIZE, file.size)
+          const chunk = file.slice(start, end)
+
+          active++
+          uploadPart(chunk, partInfo.url, partInfo.partNumber, onPartProgress)
+            .then(result => {
+              completedParts.push(result)
+              active--
+              setUpload(prev => ({ ...prev, uploadedParts: completedParts.length }))
+
+              if (completedParts.length === totalParts) {
+                resolve()
+              } else {
+                launchNext()
+              }
+            })
+            .catch(err => {
+              failed = true
+              reject(err)
+            })
+        }
+      }
+
+      launchNext()
+    })
+
+    // Step 3: Complete multipart upload on the server
+    const completeResponse = await fetch('/api/v1/multipartupload/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key,
+        uploadId,
+        parts: [...completedParts].sort((a, b) => a.PartNumber - b.PartNumber),
+      }),
+    })
+
+    if (!completeResponse.ok) {
+      const errBody = await completeResponse.json().catch(() => ({}))
+      throw new Error(errBody.error || `Complete multipart failed: ${completeResponse.status}`)
+    }
+
+    // Step 4: Generate share link & QR
+    const transferId = key || Math.random().toString(36).substring(2, 8)
+    const shareLink = `${window.location.origin}/download/${transferId}`
+    const qrColor = 'ea580c'
+    const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(shareLink)}&color=${qrColor}&bgcolor=${qrBg}`
+
+    setUpload(prev => ({
+      ...prev,
+      progress: 100,
+      speed: '0 MB/s',
+      timeRemaining: '0s',
+      status: 'completed',
+      shareLink,
+      qrCodeUrl: qrUrl,
+    }))
+    triggerNotification('File uploaded successfully!')
+  }
+
+  // Upload file via backend API → presigned URL → direct S3 upload
+  const startUpload = async (file: File) => {
     const sizeStr = formatBytes(file.size)
     setUpload({
       file,
@@ -79,48 +246,111 @@ export default function App() {
       status: 'uploading',
       shareLink: '',
       qrCodeUrl: '',
+      uploadedParts: 0,
+      totalParts: 0,
     })
 
-    let currentProgress = 0
-    const uploadSpeedMB = Math.floor(Math.random() * 35) + 25 
-    
-    const interval = setInterval(() => {
-      currentProgress += Math.floor(Math.random() * 8) + 4
-      if (currentProgress >= 100) {
-        currentProgress = 100
-        clearInterval(interval)
-        
-        const transferId = Math.random().toString(36).substring(2, 8)
-        const mockLink = `${window.location.origin}/download/${transferId}`
-        
-        // Generate QR Code. Light mode uses white bg, Dark mode uses deep black bg
-        const qrColor = 'ea580c' // Orange
-        const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
-        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(mockLink)}&color=${qrColor}&bgcolor=${qrBg}`
-
-        setUpload(prev => ({
-          ...prev,
-          progress: 100,
-          speed: '0 MB/s',
-          timeRemaining: '0s',
-          status: 'completed',
-          shareLink: mockLink,
-          qrCodeUrl: qrUrl,
-        }))
-        triggerNotification('File uploaded directly to temporary S3 pool!')
+    try {
+      if (file.size > CHUNK_SIZE) {
+        // Large files: multipart S3 upload (chunked + parallel)
+        await startMultipartUpload(file)
       } else {
-        const remainingBytes = file.size * (1 - currentProgress / 100)
-        const speedBytes = uploadSpeedMB * 1024 * 1024
-        const secondsRemaining = Math.max(1, Math.round(remainingBytes / speedBytes))
-        
-        setUpload(prev => ({
-          ...prev,
-          progress: currentProgress,
-          speed: `${uploadSpeedMB} MB/s`,
-          timeRemaining: `${secondsRemaining}s`,
-        }))
+        // Small files: single presigned PUT URL
+        const response = await fetch('/api/v1/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contentType: file.type || 'application/octet-stream',
+            fileName: file.name,
+            fileSize: file.size,
+          }),
+        })
+
+        if (!response.ok) {
+          const errBody = await response.json().catch(() => ({}))
+          throw new Error(errBody.error || `Server responded with ${response.status}`)
+        }
+
+        const data = await response.json()
+        const { url, fileID } = data
+
+        if (!url) {
+          throw new Error('No presigned URL received from server')
+        }
+
+        // Upload file directly to S3 using the presigned URL
+        await uploadFileToS3(file, url, fileID)
       }
-    }, 200)
+    } catch (err) {
+      console.error('Upload failed:', err)
+      setUpload(prev => ({
+        ...prev,
+        status: 'failed',
+        speed: '0 MB/s',
+        timeRemaining: '—',
+      }))
+      triggerNotification(
+        `Upload failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+      )
+    }
+  }
+
+  // Direct-to-S3 upload with real progress tracking via XMLHttpRequest
+  const uploadFileToS3 = (file: File, presignedUrl: string, fileID: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      const startTime = Date.now()
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const progress = Math.round((e.loaded / e.total) * 100)
+          const elapsedSec = (Date.now() - startTime) / 1000
+          const speedBps = elapsedSec > 0 ? e.loaded / elapsedSec : 0
+          const speedMB = (speedBps / (1024 * 1024)).toFixed(1)
+          const remaining = e.total - e.loaded
+          const secondsLeft = speedBps > 0 ? Math.max(1, Math.round(remaining / speedBps)) : 0
+
+          setUpload(prev => ({
+            ...prev,
+            progress,
+            speed: `${speedMB} MB/s`,
+            timeRemaining: `${secondsLeft}s`,
+          }))
+        }
+      })
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const transferId = fileID || Math.random().toString(36).substring(2, 8)
+          const shareLink = `${window.location.origin}/download/${transferId}`
+
+          const qrColor = 'ea580c' // Orange
+          const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
+          const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(shareLink)}&color=${qrColor}&bgcolor=${qrBg}`
+
+          setUpload(prev => ({
+            ...prev,
+            progress: 100,
+            speed: '0 MB/s',
+            timeRemaining: '0s',
+            status: 'completed',
+            shareLink,
+            qrCodeUrl: qrUrl,
+          }))
+          triggerNotification('File uploaded successfully!')
+          resolve()
+        } else {
+          reject(new Error(`S3 upload failed with status ${xhr.status}`))
+        }
+      })
+
+      xhr.addEventListener('error', () => reject(new Error('Network error during S3 upload')))
+      xhr.addEventListener('abort', () => reject(new Error('Upload was aborted')))
+
+      xhr.open('PUT', presignedUrl)
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+      xhr.send(file)
+    })
   }
 
   // Reset upload states
@@ -135,6 +365,8 @@ export default function App() {
       status: 'idle',
       shareLink: '',
       qrCodeUrl: '',
+      uploadedParts: 0,
+      totalParts: 0,
     })
     setDownloadStatus('available')
     setDownloadProgress(0)
@@ -150,7 +382,7 @@ export default function App() {
         if (prev >= 100) {
           clearInterval(interval)
           setDownloadStatus('completed')
-          triggerNotification('File downloaded & permanently deleted from S3!', 'info')
+          triggerNotification('File downloaded & permanently deleted!', 'info')
           return 100
         }
         return prev + 10
@@ -244,7 +476,7 @@ export default function App() {
               <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-semibold uppercase tracking-wider ${
                 isLight ? 'bg-orange-500/10 border-orange-300/40 text-orange-750' : 'bg-orange-500/10 border-orange-950/40 text-orange-400'
               }`}>
-                🚀 S3 Multipart Upload Enabled
+                🚀 Large File Support Enabled
               </div>
               
               <h1 className={`text-4xl sm:text-6xl font-black tracking-tight leading-[1.1] max-w-2xl transition-colors ${
@@ -265,7 +497,7 @@ export default function App() {
               <p className={`text-base sm:text-lg max-w-xl leading-relaxed ${
                 isLight ? 'text-slate-600' : 'text-slate-400'
               }`}>
-                Bypass the limits of WhatsApp, Telegram, and Drive storage. Upload massive files securely, share an instant QR or link, and watch the file permanently purge from S3 the moment it is downloaded.
+                Bypass the limits of WhatsApp, Telegram, and Drive storage. Upload massive files securely, share an instant QR or link, and watch the file permanently disappear the moment it is downloaded.
               </p>
 
               {/* Core Features bullets */}
@@ -280,7 +512,7 @@ export default function App() {
                   <div className={`w-5 h-5 rounded-full border flex items-center justify-center mt-1 flex-shrink-0 text-[10px] font-extrabold ${
                     isLight ? 'bg-orange-500/10 border-orange-400/30 text-orange-600' : 'bg-orange-500/10 border-orange-950/30 text-orange-400'
                   }`}>✓</div>
-                  <span className={`text-sm font-semibold ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>Instant S3 Purge on Download</span>
+                  <span className={`text-sm font-semibold ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>Instant Deletion on Download</span>
                 </div>
                 <div className="flex items-start gap-3">
                   <div className={`w-5 h-5 rounded-full border flex items-center justify-center mt-1 flex-shrink-0 text-[10px] font-extrabold ${
@@ -292,7 +524,7 @@ export default function App() {
                   <div className={`w-5 h-5 rounded-full border flex items-center justify-center mt-1 flex-shrink-0 text-[10px] font-extrabold ${
                     isLight ? 'bg-orange-500/10 border-orange-400/30 text-orange-600' : 'bg-orange-500/10 border-orange-950/30 text-orange-400'
                   }`}>✓</div>
-                  <span className={`text-sm font-semibold ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>Direct High-Speed S3 Uploads</span>
+                  <span className={`text-sm font-semibold ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>Direct High-Speed Uploads</span>
                 </div>
               </div>
             </div>
@@ -358,8 +590,11 @@ export default function App() {
                       </div>
                     </div>
 
-                    <h3 className={`text-base font-bold mb-1 ${isLight ? 'text-slate-800' : 'text-slate-200'}`}>Multipart S3 Upload</h3>
-                    <p className="text-xs text-slate-500 font-mono max-w-[250px] truncate mb-6">{upload.fileName}</p>
+                    <h3 className={`text-base font-bold mb-1 ${isLight ? 'text-slate-800' : 'text-slate-200'}`}>Uploading your file…</h3>
+                    <p className="text-xs text-slate-500 font-mono max-w-[250px] truncate mb-1">{upload.fileName}</p>
+                    <p className="text-[10px] font-bold font-mono mb-5 text-orange-500/60">
+                      {upload.totalParts > 1 ? `${upload.uploadedParts} of ${upload.totalParts} chunks sent` : upload.fileSize}
+                    </p>
 
                     <div className={`w-full rounded-full h-2.5 overflow-hidden mb-3 ${isLight ? 'bg-orange-50' : 'bg-[#151722]'}`}>
                       <div 
@@ -441,6 +676,40 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {upload.status === 'failed' && (
+                  <div className="flex flex-col items-center justify-center min-h-[300px] animate-fade-in text-center">
+                    <div className={`w-14 h-14 rounded-full flex items-center justify-center mb-4 ${
+                      isLight ? 'bg-red-500/10 border border-red-500/20 text-red-600' : 'bg-red-500/10 border border-red-500/20 text-red-400'
+                    }`}>
+                      <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </div>
+
+                    <h3 className={`text-lg font-bold mb-1 ${isLight ? 'text-slate-900' : 'text-white'}`}>Upload Failed</h3>
+                    <p className={`text-xs mb-6 max-w-[280px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+                      Something went wrong while uploading <span className="font-mono font-semibold">{upload.fileName}</span>. Please check your connection and try again.
+                    </p>
+
+                    <button
+                      onClick={() => {
+                        handleReset()
+                        fileInputRef.current?.click()
+                      }}
+                      className="w-full py-3 rounded-xl text-xs font-bold text-white transition-all shadow-md bg-orange-600 hover:bg-orange-500 shadow-orange-500/10"
+                    >
+                      Try Again
+                    </button>
+
+                    <button 
+                      onClick={handleReset}
+                      className="text-xs font-bold text-slate-500 hover:text-slate-400 transition-colors pt-4 block mx-auto"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -494,7 +763,7 @@ export default function App() {
                   </tr>
                   <tr>
                     <td className={`p-6 font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>Upload Pipeline</td>
-                    <td className="p-6 bg-orange-500/5 text-orange-550">Direct-to-S3 Multipart</td>
+                    <td className="p-6 bg-orange-500/5 text-orange-550">Direct High-Speed Upload</td>
                     <td className="p-6">Proxied through Chat server</td>
                     <td className="p-6">Proxied through Chat server</td>
                     <td className="p-6">Proxied server upload</td>
@@ -520,7 +789,7 @@ export default function App() {
                 The Single-Time Cycle
               </h2>
               <p className={`text-sm sm:text-base ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                How we securely transport large files directly through S3 without storing them.
+                How we securely transport large files without storing them.
               </p>
             </div>
 
@@ -536,9 +805,9 @@ export default function App() {
                 }`}>
                   <span className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-tr from-orange-500 to-orange-600">01</span>
                 </div>
-                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Direct S3 Stream</h4>
+                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Secure Upload</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  Large file is split into chunks and pushed directly to S3 via presigned multipart links. Bypasses intermediate servers.
+                  Large files are automatically split into smaller chunks and uploaded directly to secure cloud storage. No middlemen, no bottlenecks.
                 </p>
               </div>
 
@@ -583,7 +852,7 @@ export default function App() {
                 </div>
                 <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Instant Purge</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  The file is automatically deleted from S3. Storage is reclaimed immediately, leaving zero footprints.
+                  The file is automatically and permanently deleted. Storage is reclaimed immediately, leaving zero footprints.
                 </p>
               </div>
             </div>
@@ -605,9 +874,9 @@ export default function App() {
                     <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                   </svg>
                 </div>
-                <h3 className={`text-lg font-bold mb-3 ${isLight ? 'text-slate-900' : 'text-white'}`}>Direct-to-S3 Uploads</h3>
+                <h3 className={`text-lg font-bold mb-3 ${isLight ? 'text-slate-900' : 'text-white'}`}>High-Speed Uploads</h3>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  Bypass bottleneck servers. Your browser communicates directly with Amazon S3. That means you get maximum possible speeds based on your fiber connection.
+                  Bypass bottleneck servers. Your browser uploads directly to secure cloud storage. That means you get maximum possible speeds based on your connection.
                 </p>
               </div>
 
@@ -661,7 +930,7 @@ export default function App() {
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>How can ScanDrop transfer files larger than 5GB?</h4>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  Most platforms buffer files on their servers, causing memory exhaust on large sizes. ScanDrop requests S3 presigned multipart credentials. Your browser splits the file into multiple 10MB parts and uploads them in parallel directly to an AWS S3 bucket.
+                  Most platforms buffer files on their servers, which limits file size. ScanDrop takes a different approach — your browser splits the file into smaller chunks and uploads them simultaneously, directly to secure cloud storage. No waiting in line.
                 </p>
               </div>
 
@@ -670,7 +939,7 @@ export default function App() {
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>Can the file be downloaded a second time?</h4>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  No. The moment the server detects a request on the download link, the unique access key is revoked and marked as downloaded. An AWS delete command is immediately sent to S3, wiping the object files.
+                  No. The moment someone uses the download link, access is revoked and the file is permanently deleted from our servers. The link becomes invalid immediately.
                 </p>
               </div>
 
@@ -679,7 +948,7 @@ export default function App() {
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>What happens to files that are never downloaded?</h4>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  We enforce an AWS Lifecycle expiration rule on our S3 bucket. Any file uploaded but unclaimed will be automatically deleted after 24 hours.
+                  Unclaimed files are automatically deleted after 24 hours. No action needed — our system handles the cleanup for you.
                 </p>
               </div>
             </div>
@@ -719,7 +988,7 @@ export default function App() {
               </div>
               <div className="flex justify-between text-xs font-semibold">
                 <span className="text-slate-500">Node Speed:</span>
-                <span className="font-mono text-orange-500">Max Direct S3 Port</span>
+                <span className="font-mono text-orange-500">Maximum Speed</span>
               </div>
               <div className="flex justify-between text-xs font-semibold">
                 <span className="text-slate-500">Deletion:</span>
@@ -754,7 +1023,7 @@ export default function App() {
             {downloadStatus === 'completed' && (
               <div className="space-y-6 animate-fade-in">
                 <div className="p-4 rounded-xl border text-xs font-bold leading-relaxed text-center bg-orange-500/10 border-orange-500/20 text-orange-600">
-                  💥 File Has Been Deleted! The S3 object has been purged from the bucket. The link is now permanently expired.
+                  💥 File Has Been Deleted! The file has been permanently removed from our servers. This link is now expired and can never be used again.
                 </div>
                 
                 <button
