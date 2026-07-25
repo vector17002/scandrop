@@ -9,10 +9,12 @@ const jwtMiddleware = (req: Request, res: Response, next: NextFunction) => {
             return res.status(400).json("No token found!")
         }
 
-        const isVerified = jwt.verify(token, "hash")
+        const isVerified = jwt.verify(token, process.env.JWT_SECRET as string, {
+            issuer: "snap-drop"
+        })
 
         if(!isVerified){
-            logger.log(`Fail to find file with token: ${token}`, "ERROR");
+            logger.log(`Fail to find file`, "ERROR");
             return res.status(400).json("No file found");
         }
 

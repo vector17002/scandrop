@@ -13,7 +13,7 @@ multipartRouter.post('/' , startMultiPartUpload)
 
 multipartRouter.post('/complete', completeMultiPartUpload)
 
-downloadRouter.post('/', jwtMiddleware, downloadFileFromS3);
+downloadRouter.get('/', jwtMiddleware, downloadFileFromS3);
 
 
 
