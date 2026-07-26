@@ -4,6 +4,7 @@ import logger from "../utils/logger.js";
 import { multiPartUpload, uploadSingleFile } from "../services/s3.service.js";
 import s3Client from "../config/s3.js";
 import { CompleteMultipartUploadCommand } from "@aws-sdk/client-s3";
+import { getDownloadPresignedUrl } from "../utils/getPresignedUrl.js";
 
 export const uploadFileToS3 = async (req : Request, res: Response) => {
     const {contentType , fileName , fileSize} = req.body
@@ -14,9 +15,9 @@ export const uploadFileToS3 = async (req : Request, res: Response) => {
     }
 
     //@ts-ignore
-    const { url, fileID } = await uploadSingleFile(contentType)
+    const { url, fileToken } = await uploadSingleFile(contentType)
 
-    return res.status(200).json({ url , fileID });
+    return res.status(200).json({ url , fileToken });
 }
 
 export const startMultiPartUpload = async (req: Request , res: Response) => {
@@ -30,7 +31,12 @@ export const startMultiPartUpload = async (req: Request , res: Response) => {
     const partCount = Math.ceil(fileSize / (10 * 1024 * 1024))
     const result = await multiPartUpload(contentType, partCount)
 
-    return res.status(200).json(result)
+    const fileToken = jwt.sign({ fileKey: result?.key }, process.env.JWT_SECRET as string, {
+        expiresIn: "24h",
+        issuer: "snap-drop"
+    })
+
+    return res.status(200).json({ ...result, fileToken })
 }
 
 export const downloadFileFromS3 = async (req : Request, res: Response) => {
@@ -41,16 +47,23 @@ export const downloadFileFromS3 = async (req : Request, res: Response) => {
         return res.status(400).json("No token found")
     }
 
-    const decryptedFileID = jwt.decode(token, {
-        complete: true
-    })
-
-    if(!decryptedFileID){
-        logger.log("No file found", "INFO")
-        return res.status(404).json("No file found");
+    try {
+        jwt.verify(token, process.env.JWT_SECRET as string, {
+            issuer: "snap-drop"
+        })
+    } catch (error) {
+        logger.log("Invalid or expired token", "ERROR")
+        return res.status(401).json({ error: "Invalid or expired token" })
     }
 
-    return res.status(200).json({ message: "Download route is working!" });
+    const downloadInfo = await getDownloadPresignedUrl(token)
+
+    if(!downloadInfo?.url){
+        logger.log("No file found", "INFO")
+        return res.status(404).json({ error: "No file found" });
+    }
+
+    return res.status(200).json({ downloadUrl: downloadInfo.url })
 }
 
 export const completeMultiPartUpload = async ( req: Request , res: Response) => {
