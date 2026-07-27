@@ -60,12 +60,12 @@ export const deleteLogsFile = async (fileKey : string) => {
   }
 }
 
-export const uploadSingleFile = async (contentType : string) =>  {
+export const uploadSingleFile = async (contentType : string) => {
   try{
      const fileID = generateId()
-     const {url} = await getPresignedUrl(fileID, contentType);
+     const data = await getPresignedUrl(fileID, contentType);
 
-     return {url , fileID}
+     return data
   }catch(err){
      logger.log(`Upload failed for contentType "${contentType}": ${err instanceof Error ? err.message : err}`, "ERROR")
   }
