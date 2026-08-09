@@ -60,9 +60,10 @@ export const deleteLogsFile = async (fileKey : string) => {
   }
 }
 
-export const uploadSingleFile = async (contentType : string) => {
+export const uploadSingleFile = async (contentType : string, fileName?: string) => {
   try{
-     const fileID = generateId()
+     const safeName = fileName ? fileName.replace(/[^a-zA-Z0-9_.-]/g, '_') : ''
+     const fileID = safeName ? `${generateId()}-${safeName}` : generateId()
      const data = await getPresignedUrl(fileID, contentType);
 
      return data
@@ -71,9 +72,10 @@ export const uploadSingleFile = async (contentType : string) => {
   }
 }
 
-export const multiPartUpload = async (contentType : string, partCount : number) => {
+export const multiPartUpload = async (contentType : string, partCount : number, fileName?: string) => {
    try{
-    const fileID = generateId(); 
+    const safeName = fileName ? fileName.replace(/[^a-zA-Z0-9_.-]/g, '_') : ''
+    const fileID = safeName ? `${generateId()}-${safeName}` : generateId(); 
 
     //@ts-ignore
     const multiPartUploadCommand = await s3Client.send(

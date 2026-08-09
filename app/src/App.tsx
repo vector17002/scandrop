@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import JSZip from 'jszip'
 import { DownloadPage } from './components/DownloadPage'
 
 const CHUNK_SIZE = 10 * 1024 * 1024 // 10MB per part — must match server
@@ -11,7 +12,7 @@ interface UploadState {
   progress: number
   speed: string
   timeRemaining: string
-  status: 'idle' | 'uploading' | 'completed' | 'failed'
+  status: 'idle' | 'packaging' | 'uploading' | 'completed' | 'failed'
   shareLink: string
   qrCodeUrl: string
   uploadedParts: number
@@ -32,6 +33,8 @@ export default function App() {
   const [view, setView] = useState<'landing' | 'download'>(checkCurrentRoute)
   const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  const [isDragging, setIsDragging] = useState(false)
 
   // Sync route on browser back / forward
   useEffect(() => {
@@ -95,11 +98,161 @@ export default function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i]
   }
 
-  // Handle actual file selection
+  interface ScannedFile {
+    file: File
+    path: string
+  }
+
+  // Scan items recursively from drag-and-drop filesystem entries
+  const scanFileSystemEntry = async (entry: any, path = ''): Promise<ScannedFile[]> => {
+    if (!entry) return []
+    if (entry.isFile) {
+      return new Promise((resolve) => {
+        entry.file((file: File) => resolve([{ file, path: path + file.name }]))
+      })
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader()
+      const entries = await new Promise<any[]>((resolve) => {
+        dirReader.readEntries((entries: any[]) => resolve(entries))
+      })
+      const results = await Promise.all(
+        entries.map((child: any) => scanFileSystemEntry(child, `${path}${entry.name}/`))
+      )
+      return results.flat()
+    }
+    return []
+  }
+
+  // Process selected or dropped items (single file, multiple files, or folder)
+  const processFilesOrFolder = async (scannedItems: ScannedFile[]) => {
+    if (scannedItems.length === 0) return
+
+    // If single file without subfolder path, upload directly
+    if (scannedItems.length === 1 && !scannedItems[0].path.includes('/')) {
+      startUpload(scannedItems[0].file)
+      return
+    }
+
+    // Multiple files or folder: bundle into a zip archive preserving directory structure
+    try {
+      let zipName = 'scandrop-archive.zip'
+      const firstPath = scannedItems[0].path
+      if (firstPath.includes('/')) {
+        const topFolder = firstPath.split('/')[0]
+        if (topFolder) zipName = `${topFolder}.zip`
+      }
+
+      setUpload({
+        file: null,
+        fileName: zipName,
+        fileSize: 'Calculating...',
+        progress: 0,
+        speed: 'Packaging...',
+        timeRemaining: 'Bundling...',
+        status: 'packaging',
+        shareLink: '',
+        qrCodeUrl: '',
+        uploadedParts: 0,
+        totalParts: 0,
+        fileToken: '',
+      })
+
+      const zip = new JSZip()
+      for (const item of scannedItems) {
+        zip.file(item.path, item.file)
+      }
+
+      const zipBlob = await zip.generateAsync({ type: 'blob' }, (metadata) => {
+        setUpload(prev => ({
+          ...prev,
+          progress: Math.round(metadata.percent),
+          speed: 'Archiving files...',
+          timeRemaining: `${Math.round(metadata.percent)}%`,
+        }))
+      })
+
+      const zippedFile = new File([zipBlob], zipName, { type: 'application/zip' })
+      await startUpload(zippedFile)
+    } catch (err) {
+      console.error('Error bundling files:', err)
+      setUpload(prev => ({
+        ...prev,
+        status: 'failed',
+        speed: '0 MB/s',
+        timeRemaining: '—',
+      }))
+      triggerNotification(`Failed to package files: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    }
+  }
+
+  // Handle multi-file selection
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0]
-    if (selectedFile) {
-      startUpload(selectedFile)
+    const files = e.target.files
+    if (!files || files.length === 0) return
+    const fileList = Array.from(files)
+    const scanned: ScannedFile[] = fileList.map(file => ({
+      file,
+      path: (file as any).webkitRelativePath || file.name
+    }))
+    processFilesOrFolder(scanned)
+    e.target.value = ''
+  }
+
+  // Handle folder selection
+  const handleFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (!files || files.length === 0) return
+    const fileList = Array.from(files)
+    const scanned: ScannedFile[] = fileList.map(file => ({
+      file,
+      path: (file as any).webkitRelativePath || file.name
+    }))
+    processFilesOrFolder(scanned)
+    e.target.value = ''
+  }
+
+  // Handle Drag & Drop for files and folders
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+  }
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+
+    const items = e.dataTransfer.items
+    if (!items || items.length === 0) return
+
+    const scannedItems: ScannedFile[] = []
+    const promises: Promise<ScannedFile[]>[] = []
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      const entry = (item as any).webkitGetAsEntry ? (item as any).webkitGetAsEntry() : null
+      if (entry) {
+        promises.push(scanFileSystemEntry(entry))
+      } else {
+        const file = item.getAsFile()
+        if (file) scannedItems.push({ file, path: file.name })
+      }
+    }
+
+    if (promises.length > 0) {
+      const results = await Promise.all(promises)
+      scannedItems.push(...results.flat())
+    }
+
+    if (scannedItems.length > 0) {
+      processFilesOrFolder(scannedItems)
     }
   }
 
@@ -570,41 +723,111 @@ export default function App() {
                 <input
                   type="file"
                   ref={fileInputRef}
+                  multiple
                   onChange={handleFileChange}
                   className="hidden"
                 />
 
+                <input
+                  type="file"
+                  ref={folderInputRef}
+                  onChange={handleFolderChange}
+                  className="hidden"
+                  {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                />
+
                 {upload.status === 'idle' && (
                   <div 
-                    onClick={() => fileInputRef.current?.click()}
-                    className={`border-2 border-dashed rounded-2xl p-10 flex flex-col items-center justify-center min-h-[300px] transition-all cursor-pointer group ${
-                      isLight 
-                        ? 'border-orange-200 bg-orange-50/15 hover:border-orange-500/50' 
-                        : 'border-orange-900/30 bg-[#08090d]/60 hover:border-orange-500/60'
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    className={`border-2 border-dashed rounded-2xl p-8 flex flex-col items-center justify-center min-h-[300px] transition-all relative ${
+                      isDragging 
+                        ? 'border-orange-500 bg-orange-500/10 scale-[1.02]' 
+                        : isLight 
+                          ? 'border-orange-200 bg-orange-50/15 hover:border-orange-500/50' 
+                          : 'border-orange-900/30 bg-[#08090d]/60 hover:border-orange-500/60'
                     }`}
                   >
-                    <div className={`w-16 h-16 rounded-2xl border flex items-center justify-center mb-6 group-hover:scale-105 transition-all shadow-md ${
+                    <div className={`w-16 h-16 rounded-2xl border flex items-center justify-center mb-5 shadow-md ${
                       isLight 
-                        ? 'bg-orange-50/50 border-orange-100 text-orange-600 group-hover:border-orange-300' 
-                        : 'bg-[#12141c] border-orange-950/50 text-orange-400 group-hover:border-orange-500/30'
+                        ? 'bg-orange-50/50 border-orange-100 text-orange-600' 
+                        : 'bg-[#12141c] border-orange-950/50 text-orange-400'
                     }`}>
                       <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                       </svg>
                     </div>
-                    <span className={`text-base font-bold mb-1 transition-colors ${
-                      isLight ? 'text-slate-800 group-hover:text-orange-600' : 'text-slate-200 group-hover:text-orange-400'
-                    }`}>
-                      Select or drop file
-                    </span>
-                    <span className="text-xs text-slate-500 mb-6 font-medium">Supports files up to 50 GB</span>
                     
-                    <button 
-                      type="button" 
-                      className="px-5 py-2.5 rounded-xl text-xs font-bold text-white transition-all shadow-lg bg-orange-600 hover:bg-orange-500 shadow-orange-500/10"
-                    >
-                      Browse Files
-                    </button>
+                    <span className={`text-base font-bold mb-1 text-center ${
+                      isLight ? 'text-slate-800' : 'text-slate-200'
+                    }`}>
+                      {isDragging ? 'Drop file(s) or folder here' : 'Drop file(s) or folder here'}
+                    </span>
+                    <span className="text-xs text-slate-500 mb-6 font-medium text-center">
+                      Upload individual files, multiple files, or an entire folder
+                    </span>
+                    
+                    <div className="flex flex-wrap justify-center gap-3">
+                      <button 
+                        type="button" 
+                        onClick={() => fileInputRef.current?.click()}
+                        className="px-4 py-2.5 rounded-xl text-xs font-bold text-white transition-all shadow-lg bg-orange-600 hover:bg-orange-500 shadow-orange-500/10 flex items-center gap-2"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        <span>Select File(s)</span>
+                      </button>
+
+                      <button 
+                        type="button" 
+                        onClick={() => folderInputRef.current?.click()}
+                        className={`px-4 py-2.5 rounded-xl text-xs font-bold border transition-all flex items-center gap-2 ${
+                          isLight 
+                            ? 'bg-orange-50 border-orange-200 text-orange-700 hover:bg-orange-100' 
+                            : 'bg-slate-800 border-orange-900/40 text-slate-200 hover:bg-slate-700'
+                        }`}
+                      >
+                        <svg className="w-4 h-4 text-orange-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                        </svg>
+                        <span>Select Folder</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {upload.status === 'packaging' && (
+                  <div className="flex flex-col items-center justify-center min-h-[300px]">
+                    <div className="relative w-20 h-20 mb-6">
+                      <div className={`absolute inset-0 rounded-full border-4 ${isLight ? 'border-orange-500/20' : 'border-orange-500/25'}`}></div>
+                      <div className="absolute inset-0 rounded-full border-4 border-t-transparent animate-spin border-orange-500"></div>
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <svg className="w-7 h-7 animate-pulse text-orange-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 8h14M5 8a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v1a2 2 0 01-2 2M5 8v10a2 2 0 002 2h14a2 2 0 002-2V8m-9 4h4" />
+                        </svg>
+                      </div>
+                    </div>
+
+                    <h3 className={`text-base font-bold mb-1 ${isLight ? 'text-slate-800' : 'text-slate-200'}`}>Archiving files & folder…</h3>
+                    <p className="text-xs text-slate-500 font-mono max-w-[250px] truncate mb-1">{upload.fileName}</p>
+                    <p className="text-[10px] font-bold font-mono mb-5 text-orange-500/60">
+                      Creating zero-loss zip archive
+                    </p>
+
+                    <div className={`w-full rounded-full h-2.5 overflow-hidden mb-3 ${isLight ? 'bg-orange-50' : 'bg-[#151722]'}`}>
+                      <div 
+                        className="h-full rounded-full transition-all duration-200 bg-gradient-to-r from-orange-500 via-orange-600 to-amber-500" 
+                        style={{ width: `${upload.progress}%` }}
+                      ></div>
+                    </div>
+
+                    <div className="flex items-center justify-between w-full text-xs font-semibold font-mono text-slate-400">
+                      <span className="text-orange-500">{upload.progress}%</span>
+                      <span>{upload.speed}</span>
+                      <span>{upload.timeRemaining}</span>
+                    </div>
                   </div>
                 )}
 
