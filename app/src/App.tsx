@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { DownloadPage } from './components/DownloadPage'
 
 const CHUNK_SIZE = 10 * 1024 * 1024 // 10MB per part — must match server
 const MAX_CONCURRENT_UPLOADS = 4
@@ -15,12 +16,31 @@ interface UploadState {
   qrCodeUrl: string
   uploadedParts: number
   totalParts: number
+  fileToken: string
 }
 
 export default function App() {
-  const [view, setView] = useState<'landing' | 'recipient'>('landing')
-  const theme = 'light'
+  const checkCurrentRoute = (): 'landing' | 'download' => {
+    const path = window.location.pathname
+    const search = window.location.search
+    if (path.startsWith('/download') || search.includes('token=')) {
+      return 'download'
+    }
+    return 'landing'
+  }
+
+  const [view, setView] = useState<'landing' | 'download'>(checkCurrentRoute)
+  const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Sync route on browser back / forward
+  useEffect(() => {
+    const handlePopState = () => {
+      setView(checkCurrentRoute())
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
   
   // Client Upload State
   const [upload, setUpload] = useState<UploadState>({
@@ -35,11 +55,8 @@ export default function App() {
     qrCodeUrl: '',
     uploadedParts: 0,
     totalParts: 0,
+    fileToken: '',
   })
-
-  // Recipient Simulation State
-  const [downloadProgress, setDownloadProgress] = useState(0)
-  const [downloadStatus, setDownloadStatus] = useState<'available' | 'downloading' | 'completed'>('available')
 
   // Notifications
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'info' } | null>(null)
@@ -50,10 +67,23 @@ export default function App() {
 
   useEffect(() => {
     if (notification) {
-      const timer = setTimeout(() => setNotification(null), 3000)
+      const timer = setTimeout(() => setNotification(null), 3500)
       return () => clearTimeout(timer)
     }
   }, [notification])
+
+  const navigateToHome = () => {
+    window.history.pushState({}, '', '/')
+    setView('landing')
+    handleReset()
+  }
+
+  const navigateToDownload = (tokenString?: string) => {
+    const targetToken = tokenString || upload.fileToken
+    const link = targetToken ? `/download?token=${encodeURIComponent(targetToken)}` : '/download'
+    window.history.pushState({}, '', link)
+    setView('download')
+  }
 
   // Formatter for file size
   const formatBytes = (bytes: number, decimals = 2) => {
@@ -128,7 +158,7 @@ export default function App() {
       throw new Error(errBody.error || `Server responded with ${initResponse.status}`)
     }
 
-    const { uploadId, key, urls } = await initResponse.json()
+    const { uploadId, key, urls, fileToken } = await initResponse.json()
 
     if (!uploadId || !key || !urls?.length) {
       throw new Error('Invalid multipart upload initiation response')
@@ -215,8 +245,8 @@ export default function App() {
     }
 
     // Step 4: Generate share link & QR
-    const transferId = key || Math.random().toString(36).substring(2, 8)
-    const shareLink = `${window.location.origin}/download/${transferId}`
+    const token = fileToken || key
+    const shareLink = `${window.location.origin}/download?token=${encodeURIComponent(token)}`
     const qrColor = 'ea580c'
     const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(shareLink)}&color=${qrColor}&bgcolor=${qrBg}`
@@ -229,6 +259,7 @@ export default function App() {
       status: 'completed',
       shareLink,
       qrCodeUrl: qrUrl,
+      fileToken: token,
     }))
     triggerNotification('File uploaded successfully!')
   }
@@ -248,6 +279,7 @@ export default function App() {
       qrCodeUrl: '',
       uploadedParts: 0,
       totalParts: 0,
+      fileToken: '',
     })
 
     try {
@@ -272,14 +304,14 @@ export default function App() {
         }
 
         const data = await response.json()
-        const { url, fileID } = data
+        const { url, fileToken } = data
 
         if (!url) {
           throw new Error('No presigned URL received from server')
         }
 
         // Upload file directly to S3 using the presigned URL
-        await uploadFileToS3(file, url, fileID)
+        await uploadFileToS3(file, url, fileToken)
       }
     } catch (err) {
       console.error('Upload failed:', err)
@@ -296,7 +328,7 @@ export default function App() {
   }
 
   // Direct-to-S3 upload with real progress tracking via XMLHttpRequest
-  const uploadFileToS3 = (file: File, presignedUrl: string, fileID: string): Promise<void> => {
+  const uploadFileToS3 = (file: File, presignedUrl: string, fileToken: string): Promise<void> => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       const startTime = Date.now()
@@ -321,8 +353,7 @@ export default function App() {
 
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          const transferId = fileID || Math.random().toString(36).substring(2, 8)
-          const shareLink = `${window.location.origin}/download/${transferId}`
+          const shareLink = `${window.location.origin}/download?token=${encodeURIComponent(fileToken)}`
 
           const qrColor = 'ea580c' // Orange
           const qrBg = theme === 'light' ? 'ffffff' : '0c0d12'
@@ -336,6 +367,7 @@ export default function App() {
             status: 'completed',
             shareLink,
             qrCodeUrl: qrUrl,
+            fileToken,
           }))
           triggerNotification('File uploaded successfully!')
           resolve()
@@ -367,37 +399,18 @@ export default function App() {
       qrCodeUrl: '',
       uploadedParts: 0,
       totalParts: 0,
+      fileToken: '',
     })
-    setDownloadStatus('available')
-    setDownloadProgress(0)
-  }
-
-  // Simulate Recipient Download & S3 self-destruct
-  const startSimulatedDownload = () => {
-    setDownloadStatus('downloading')
-    setDownloadProgress(0)
-
-    const interval = setInterval(() => {
-      setDownloadProgress(prev => {
-        if (prev >= 100) {
-          clearInterval(interval)
-          setDownloadStatus('completed')
-          triggerNotification('File downloaded & permanently deleted!', 'info')
-          return 100
-        }
-        return prev + 10
-      })
-    }, 150)
   }
 
   const isLight = theme === 'light'
 
   return (
-    <div className={`h-screen flex flex-col font-sans selection:text-white transition-colors duration-300 relative overflow-x-hidden ${
+    <div className={`min-h-screen flex flex-col font-sans selection:text-white transition-colors duration-300 relative overflow-x-hidden ${
       isLight ? 'bg-[#fcfaf7] text-slate-800 selection:bg-orange-500' : 'bg-[#06070a] text-slate-200 selection:bg-orange-500'
     }`}>
       
-      {/* Decorative Glow Backgrounds (Orange glow in both Light and Dark) */}
+      {/* Decorative Glow Backgrounds */}
       {isLight ? (
         <>
           <div className="absolute top-[-10%] left-[-15%] w-[600px] h-[600px] rounded-full bg-orange-400/8 blur-[130px] pointer-events-none animate-pulse-slow"></div>
@@ -412,13 +425,13 @@ export default function App() {
         </>
       )}
 
-      {/* Notifications */}
+      {/* Notifications Toast */}
       {notification && (
         <div className={`fixed top-6 right-6 z-50 flex items-center gap-3 border backdrop-blur-md px-5 py-4 rounded-2xl shadow-2xl animate-fade-in ${
-          isLight ? 'bg-white border-orange-200/60' : 'bg-[#0c0d12] border-orange-950/50'
+          isLight ? 'bg-white/95 border-orange-200/60 text-slate-800' : 'bg-[#0c0d12]/95 border-orange-950/50 text-slate-200'
         }`}>
           <div className="w-2.5 h-2.5 rounded-full bg-orange-500 shadow-[0_0_8px_#f97316]"></div>
-          <span className={`text-sm font-semibold ${isLight ? 'text-slate-800' : 'text-slate-200'}`}>
+          <span className="text-sm font-semibold">
             {notification.message}
           </span>
         </div>
@@ -429,7 +442,7 @@ export default function App() {
         isLight ? 'border-orange-100/60 bg-[#fcfaf7]' : 'border-orange-950/45 bg-[#06070a]'
       }`}>
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
-          <div className="flex items-center gap-3 cursor-pointer animate-fade-in" onClick={() => { setView('landing'); handleReset(); }}>
+          <div className="flex items-center gap-3 cursor-pointer animate-fade-in" onClick={navigateToHome}>
             <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-lg bg-gradient-to-tr from-orange-500 via-orange-600 to-amber-500 shadow-orange-500/20">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M8 7l4-4m0 0l4 4m-4-4v18" />
@@ -448,18 +461,35 @@ export default function App() {
           </div>
 
           <nav className="hidden md:flex items-center gap-8">
-            <a href="#how-it-works" className={`text-sm font-medium transition-colors ${
+            <a href="#how-it-works" onClick={() => setView('landing')} className={`text-sm font-medium transition-colors ${
               isLight ? 'text-slate-500 hover:text-slate-800' : 'text-slate-400 hover:text-slate-200'
             }`}>How It Works</a>
-            <a href="#matrix" className={`text-sm font-medium transition-colors ${
+            <a href="#matrix" onClick={() => setView('landing')} className={`text-sm font-medium transition-colors ${
               isLight ? 'text-slate-500 hover:text-slate-800' : 'text-slate-400 hover:text-slate-200'
             }`}>Comparison</a>
-            <a href="#faqs" className={`text-sm font-medium transition-colors ${
+            <a href="#faqs" onClick={() => setView('landing')} className={`text-sm font-medium transition-colors ${
               isLight ? 'text-slate-500 hover:text-slate-800' : 'text-slate-400 hover:text-slate-200'
             }`}>FAQ</a>
           </nav>
 
-
+          {/* Theme Toggle Button */}
+          <button
+            onClick={() => setTheme(prev => (prev === 'light' ? 'dark' : 'light'))}
+            className={`p-2.5 rounded-xl border transition-all ${
+              isLight ? 'bg-orange-50/50 border-orange-200/60 text-slate-700 hover:bg-orange-100' : 'bg-slate-900 border-orange-950/60 text-slate-300 hover:bg-slate-800'
+            }`}
+            title="Toggle theme"
+          >
+            {isLight ? (
+              <svg className="w-5 h-5 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+              </svg>
+            )}
+          </button>
         </div>
       </header>
 
@@ -474,7 +504,7 @@ export default function App() {
             {/* Hero Copy */}
             <div className="lg:col-span-7 space-y-8 text-left">
               <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-semibold uppercase tracking-wider ${
-                isLight ? 'bg-orange-500/10 border-orange-300/40 text-orange-750' : 'bg-orange-500/10 border-orange-950/40 text-orange-400'
+                isLight ? 'bg-orange-500/10 border-orange-300/40 text-orange-700' : 'bg-orange-500/10 border-orange-950/40 text-orange-400'
               }`}>
                 🚀 Large File Support Enabled
               </div>
@@ -556,7 +586,7 @@ export default function App() {
                     <div className={`w-16 h-16 rounded-2xl border flex items-center justify-center mb-6 group-hover:scale-105 transition-all shadow-md ${
                       isLight 
                         ? 'bg-orange-50/50 border-orange-100 text-orange-600 group-hover:border-orange-300' 
-                        : 'bg-[#12141c] border-orange-950/50 text-orange-450 group-hover:border-orange-500/30'
+                        : 'bg-[#12141c] border-orange-950/50 text-orange-400 group-hover:border-orange-500/30'
                     }`}>
                       <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -658,10 +688,10 @@ export default function App() {
                       </div>
 
                       <button
-                        onClick={() => setView('recipient')}
+                        onClick={() => navigateToDownload(upload.fileToken)}
                         className="w-full py-3 rounded-xl text-xs font-bold text-white transition-all shadow-md bg-orange-600 hover:bg-orange-500 shadow-orange-500/10 flex items-center justify-center gap-2"
                       >
-                        <span>Simulate Recipient View (Test Flow)</span>
+                        <span>Open Recipient Download Page</span>
                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                           <path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
                         </svg>
@@ -749,31 +779,31 @@ export default function App() {
                 }`}>
                   <tr>
                     <td className={`p-6 font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>Max File Size Limit</td>
-                    <td className="p-6 font-extrabold bg-orange-500/5 text-orange-550">50 GB+ (No Limit)</td>
+                    <td className="p-6 font-extrabold bg-orange-500/5 text-orange-500">50 GB+ (No Limit)</td>
                     <td className="p-6 text-slate-500">2 GB (4 GB Premium)</td>
                     <td className="p-6 text-slate-500">2 GB</td>
                     <td className="p-6 text-slate-500">15 GB (Free storage cap)</td>
                   </tr>
                   <tr>
                     <td className={`p-6 font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>Storage Expiry Policy</td>
-                    <td className="p-6 bg-orange-500/5 text-orange-550">Instant delete on download</td>
-                    <td className="p-6">Persistent in cloud chat</td>
-                    <td className="p-6">Persistent in backup</td>
-                    <td className="p-6">Kept until manually deleted</td>
+                    <td className="p-6 bg-orange-500/5 text-orange-500">Instant delete on download</td>
+                    <td className="p-6 text-slate-500">Persistent in cloud chat</td>
+                    <td className="p-6 text-slate-500">Persistent in backup</td>
+                    <td className="p-6 text-slate-500">Kept until manually deleted</td>
                   </tr>
                   <tr>
                     <td className={`p-6 font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>Upload Pipeline</td>
-                    <td className="p-6 bg-orange-500/5 text-orange-550">Direct High-Speed Upload</td>
-                    <td className="p-6">Proxied through Chat server</td>
-                    <td className="p-6">Proxied through Chat server</td>
-                    <td className="p-6">Proxied server upload</td>
+                    <td className="p-6 bg-orange-500/5 text-orange-500">Direct High-Speed Upload</td>
+                    <td className="p-6 text-slate-500">Proxied through Chat server</td>
+                    <td className="p-6 text-slate-500">Proxied through Chat server</td>
+                    <td className="p-6 text-slate-500">Proxied server upload</td>
                   </tr>
                   <tr>
                     <td className={`p-6 font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>Privacy / Accounts</td>
-                    <td className="p-6 bg-orange-500/5 text-orange-550">No Account, No Logs</td>
-                    <td className="p-6">Phone Number Required</td>
-                    <td className="p-6">Phone Number Required</td>
-                    <td className="p-6">Google Account Required</td>
+                    <td className="p-6 bg-orange-500/5 text-orange-500">No Account, No Logs</td>
+                    <td className="p-6 text-slate-500">Phone Number Required</td>
+                    <td className="p-6 text-slate-500">Phone Number Required</td>
+                    <td className="p-6 text-slate-500">Google Account Required</td>
                   </tr>
                 </tbody>
               </table>
@@ -805,9 +835,9 @@ export default function App() {
                 }`}>
                   <span className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-tr from-orange-500 to-orange-600">01</span>
                 </div>
-                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Secure Upload</h4>
+                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-800' : 'text-white'}`}>Secure Upload</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  Large files are automatically split into smaller chunks and uploaded directly to secure cloud storage. No middlemen, no bottlenecks.
+                  Large files are automatically split into smaller chunks and uploaded directly to secure cloud storage.
                 </p>
               </div>
 
@@ -820,9 +850,9 @@ export default function App() {
                 }`}>
                   <span className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-tr from-orange-500 to-orange-600">02</span>
                 </div>
-                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Secure Link & QR</h4>
+                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-800' : 'text-white'}`}>Secure Link & QR</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  ScanDrop generates a cryptographically random, one-time URL and QR code key for recipient download.
+                  ScanDrop generates a cryptographically random, one-time JWT URL and QR code key for recipient download.
                 </p>
               </div>
 
@@ -835,9 +865,9 @@ export default function App() {
                 }`}>
                   <span className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-tr from-orange-500 to-orange-600">03</span>
                 </div>
-                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>One-Time Download</h4>
+                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-800' : 'text-white'}`}>One-Time Download</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  Recipient scans the QR and downloads the file. The backend immediately revokes access token.
+                  Recipient scans the QR and fetches the file via S3 presigned download URL.
                 </p>
               </div>
 
@@ -850,9 +880,9 @@ export default function App() {
                 }`}>
                   <span className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-tr from-orange-500 to-orange-600">04</span>
                 </div>
-                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-850' : 'text-white'}`}>Instant Purge</h4>
+                <h4 className={`text-base font-bold mb-2 ${isLight ? 'text-slate-800' : 'text-white'}`}>Instant Purge</h4>
                 <p className={`text-xs leading-relaxed max-w-[200px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  The file is automatically and permanently deleted. Storage is reclaimed immediately, leaving zero footprints.
+                  The file access token is immediately spent. Storage is reclaimed, leaving zero footprints.
                 </p>
               </div>
             </div>
@@ -876,7 +906,7 @@ export default function App() {
                 </div>
                 <h3 className={`text-lg font-bold mb-3 ${isLight ? 'text-slate-900' : 'text-white'}`}>High-Speed Uploads</h3>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  Bypass bottleneck servers. Your browser uploads directly to secure cloud storage. That means you get maximum possible speeds based on your connection.
+                  Bypass bottleneck servers. Your browser uploads directly to secure cloud storage with multi-part parallel streams.
                 </p>
               </div>
 
@@ -892,7 +922,7 @@ export default function App() {
                 </div>
                 <h3 className={`text-lg font-bold mb-3 ${isLight ? 'text-slate-900' : 'text-white'}`}>Zero-Knowledge System</h3>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  We don't know who you are, who you are sending to, or what the file contents are. No analytics trackers, no advertising platforms, and no log persistence.
+                  No registration or account creation required. No analytics trackers or persistent user session database.
                 </p>
               </div>
 
@@ -908,7 +938,7 @@ export default function App() {
                 </div>
                 <h3 className={`text-lg font-bold mb-3 ${isLight ? 'text-slate-900' : 'text-white'}`}>Self-Destruct Triggers</h3>
                 <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                  As soon as the recipient initiates the download, the backend generates an AWS Delete Object call to wipe the file. Unclaimed files automatically expire.
+                  As soon as the recipient initiates download or 24 hours elapse, access keys expire automatically.
                 </p>
               </div>
 
@@ -929,8 +959,8 @@ export default function App() {
                 isLight ? 'bg-orange-50/15 border-orange-100/70' : 'bg-[#0c0d12]/40 border-orange-950/30'
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>How can ScanDrop transfer files larger than 5GB?</h4>
-                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  Most platforms buffer files on their servers, which limits file size. ScanDrop takes a different approach — your browser splits the file into smaller chunks and uploads them simultaneously, directly to secure cloud storage. No waiting in line.
+                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>
+                  ScanDrop splits large files into smaller chunks in your browser and uploads them concurrently using AWS S3 multipart presigned URLs.
                 </p>
               </div>
 
@@ -938,8 +968,8 @@ export default function App() {
                 isLight ? 'bg-orange-50/15 border-orange-100/70' : 'bg-[#0c0d12]/40 border-orange-950/30'
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>Can the file be downloaded a second time?</h4>
-                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  No. The moment someone uses the download link, access is revoked and the file is permanently deleted from our servers. The link becomes invalid immediately.
+                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>
+                  No. The JWT download token is signed with a strict single-use / 24-hour expiration policy. Once downloaded, access is revoked.
                 </p>
               </div>
 
@@ -947,8 +977,8 @@ export default function App() {
                 isLight ? 'bg-orange-50/15 border-orange-100/70' : 'bg-[#0c0d12]/40 border-orange-950/30'
               }`}>
                 <h4 className={`text-sm font-bold mb-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>What happens to files that are never downloaded?</h4>
-                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-605' : 'text-slate-400'}`}>
-                  Unclaimed files are automatically deleted after 24 hours. No action needed — our system handles the cleanup for you.
+                <p className={`text-xs leading-relaxed ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>
+                  Unclaimed files automatically expire after 24 hours via S3 lifecycle policies and token invalidation.
                 </p>
               </div>
             </div>
@@ -956,101 +986,13 @@ export default function App() {
 
         </div>
       ) : (
-        /* ==================== RECIPIENT SIMULATION VIEW ==================== */
-        <div className="max-w-md mx-auto px-6 py-24 animate-slide-up">
-          <div className={`border rounded-3xl p-8 backdrop-blur-md text-center ${
-            isLight 
-              ? 'bg-white border-orange-100 shadow-xl shadow-orange-100/20' 
-              : 'bg-[#0c0d12]/90 border-orange-950/40 shadow-2xl'
-          }`}>
-            
-            <div className="mb-6">
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[10px] font-bold uppercase tracking-wider bg-orange-500/10 border-orange-500/20 text-orange-550">
-                ⚠️ Single-Use Secure Link
-              </div>
-            </div>
-
-            <div className="w-16 h-16 rounded-2xl border flex items-center justify-center mx-auto mb-6 bg-orange-500/10 border-orange-500/20 text-orange-500">
-              <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-            </div>
-
-            <h2 className={`text-xl font-extrabold mb-1 ${isLight ? 'text-slate-900' : 'text-white'}`}>Download Ready</h2>
-            <p className="text-xs text-slate-500 font-mono max-w-[280px] truncate mx-auto mb-6">{upload.fileName}</p>
-
-            <div className={`p-4 border rounded-2xl mb-8 space-y-2 text-left ${
-              isLight ? 'bg-orange-50/15 border-orange-100' : 'bg-[#08090d]/60 border-orange-950/45'
-            }`}>
-              <div className="flex justify-between text-xs font-semibold">
-                <span className="text-slate-500">File Size:</span>
-                <span className={`font-mono ${isLight ? 'text-slate-800' : 'text-slate-300'}`}>{upload.fileSize}</span>
-              </div>
-              <div className="flex justify-between text-xs font-semibold">
-                <span className="text-slate-500">Node Speed:</span>
-                <span className="font-mono text-orange-500">Maximum Speed</span>
-              </div>
-              <div className="flex justify-between text-xs font-semibold">
-                <span className="text-slate-500">Deletion:</span>
-                <span className="font-semibold text-orange-500">Immediate upon download</span>
-              </div>
-            </div>
-
-            {downloadStatus === 'available' && (
-              <button
-                onClick={startSimulatedDownload}
-                className="w-full py-3.5 rounded-xl text-xs font-bold text-white transition-all shadow-lg active:scale-95 bg-orange-600 hover:bg-orange-500 shadow-orange-500/10"
-              >
-                Secure Download Now
-              </button>
-            )}
-
-            {downloadStatus === 'downloading' && (
-              <div className="space-y-3">
-                <div className={`w-full rounded-full h-2.5 overflow-hidden ${isLight ? 'bg-orange-50' : 'bg-[#151722]'}`}>
-                  <div 
-                    className="h-full rounded-full transition-all duration-150 bg-orange-500" 
-                    style={{ width: `${downloadProgress}%` }}
-                  ></div>
-                </div>
-                <div className="flex justify-between text-[10px] text-slate-500 font-mono">
-                  <span>Downloading...</span>
-                  <span>{downloadProgress}%</span>
-                </div>
-              </div>
-            )}
-
-            {downloadStatus === 'completed' && (
-              <div className="space-y-6 animate-fade-in">
-                <div className="p-4 rounded-xl border text-xs font-bold leading-relaxed text-center bg-orange-500/10 border-orange-500/20 text-orange-600">
-                  💥 File Has Been Deleted! The file has been permanently removed from our servers. This link is now expired and can never be used again.
-                </div>
-                
-                <button
-                  onClick={() => {
-                    setView('landing')
-                    handleReset()
-                  }}
-                  className={`w-full py-3.5 rounded-xl text-xs font-bold transition-all border ${
-                    isLight 
-                      ? 'bg-white border-orange-200 text-orange-700 hover:bg-orange-50' 
-                      : 'bg-slate-800 border-orange-900/40 text-slate-300 hover:bg-slate-700'
-                  }`}
-                >
-                  Create New Drop Link
-                </button>
-              </div>
-            )}
-
-            <button 
-              onClick={() => setView('landing')}
-              className="text-xs font-semibold text-slate-500 hover:text-slate-400 transition-colors pt-6 block mx-auto"
-            >
-              ← Cancel and Return Home
-            </button>
-
-          </div>
-        </div>
+        /* ==================== DOWNLOAD PAGE VIEW ==================== */
+        <DownloadPage
+          theme={theme}
+          token={upload.fileToken}
+          onReturnHome={navigateToHome}
+          triggerNotification={triggerNotification}
+        />
       )}
       </main>
 
