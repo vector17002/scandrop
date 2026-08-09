@@ -11,7 +11,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://scandrop-alb-1254203703.ap-south-1.elb.amazonaws.com',
+        target: 'https://scandrop-ihuc.onrender.com',
         // target: "http://localhost:3000",
         changeOrigin: true,
       },
