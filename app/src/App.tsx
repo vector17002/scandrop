@@ -388,7 +388,7 @@ export default function App() {
       body: JSON.stringify({
         key,
         uploadId,
-        parts: completedParts,
+        parts: [...completedParts].sort((a, b) => a.PartNumber - b.PartNumber),
       }),
     })
 
