@@ -7,7 +7,7 @@ import rateLimiterMiddleware from "./middleware/ratelimiterMiddleware.js";
 const app = express();
 
 app.use(cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(',') ??  ["https://scandrop-ihuc.onrender.com,https://scandrop-8v9p0zpve-geek-sanemi.vercel.app"],
+    origin: process.env.ALLOWED_ORIGINS?.split(',') ??  ["https://scanndropp.vercel.app"],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
