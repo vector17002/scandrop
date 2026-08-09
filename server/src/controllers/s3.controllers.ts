@@ -15,7 +15,7 @@ export const uploadFileToS3 = async (req : Request, res: Response) => {
     }
 
     //@ts-ignore
-    const { url, fileToken } = await uploadSingleFile(contentType)
+    const { url, fileToken } = await uploadSingleFile(contentType, fileName)
 
     return res.status(200).json({ url , fileToken });
 }
@@ -29,7 +29,7 @@ export const startMultiPartUpload = async (req: Request , res: Response) => {
     }
 
     const partCount = Math.ceil(fileSize / (10 * 1024 * 1024))
-    const result = await multiPartUpload(contentType, partCount)
+    const result = await multiPartUpload(contentType, partCount, fileName)
 
     const fileToken = jwt.sign({ fileKey: result?.key }, process.env.JWT_SECRET as string, {
         expiresIn: "24h",
