@@ -2,6 +2,9 @@ import { useState, useEffect, useRef } from 'react'
 import JSZip from 'jszip'
 import { DownloadPage } from './components/DownloadPage'
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL?.replace(/\/$/, '') || ''
+const buildApiUrl = (path: string) => BACKEND_URL ? `${BACKEND_URL}${path}` : path
+
 const CHUNK_SIZE = 10 * 1024 * 1024 // 10MB per part — must match server
 const MAX_CONCURRENT_UPLOADS = 4
 
@@ -296,7 +299,7 @@ export default function App() {
   // Orchestrate multipart upload: init → parallel chunk uploads → complete
   const startMultipartUpload = async (file: File) => {
     // Step 1: Initiate multipart upload via backend
-    const initResponse = await fetch('/api/v1/multipartupload', {
+    const initResponse = await fetch(buildApiUrl('/api/v1/multipartupload'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -382,7 +385,7 @@ export default function App() {
     })
 
     // Step 3: Complete multipart upload on the server
-    const completeResponse = await fetch('/api/v1/multipartupload/complete', {
+    const completeResponse = await fetch(buildApiUrl('/api/v1/multipartupload/complete'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -441,7 +444,7 @@ export default function App() {
         await startMultipartUpload(file)
       } else {
         // Small files: single presigned PUT URL
-        const response = await fetch('/api/v1/upload', {
+        const response = await fetch(buildApiUrl('/api/v1/upload'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

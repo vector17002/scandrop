@@ -1,5 +1,8 @@
 import React, { useState, useEffect } from 'react'
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL?.replace(/\/$/, '') || ''
+const buildApiUrl = (path: string) => BACKEND_URL ? `${BACKEND_URL}${path}` : path
+
 interface DownloadPageProps {
   token?: string
   theme?: 'light' | 'dark'
@@ -138,7 +141,7 @@ export const DownloadPage: React.FC<DownloadPageProps> = ({
     setErrorMessage(null)
 
     try {
-      const response = await fetch(`/api/v1/download?token=${encodeURIComponent(token)}`)
+      const response = await fetch(buildApiUrl(`/api/v1/download?token=${encodeURIComponent(token)}`))
 
       if (!response.ok) {
         let errText = 'Failed to fetch download link'
